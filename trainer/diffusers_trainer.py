@@ -27,6 +27,8 @@ import json
 import re
 import traceback
 import shutil
+from typing import Optional
+from functools import reduce
 
 try:
     pynvml.nvmlInit()
@@ -41,8 +43,7 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from PIL import Image, ImageOps
 from PIL.Image import Image as Img
 
-from typing import Dict, List, Generator, Tuple
-from scipy.interpolate import interp1d
+from typing import Generator, Tuple
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -293,204 +294,135 @@ class ImageStore:
             return f.read()
 
 
-# ====================================== #
-# Bucketing code stolen from hasuwoof:   #
-# https://github.com/hasuwoof/huskystack #
-# ====================================== #
-
-class AspectBucket:
-    def __init__(self, store: ImageStore,
-                 num_buckets: int,
-                 batch_size: int,
-                 bucket_side_min: int = 256,
-                 bucket_side_max: int = 768,
-                 bucket_side_increment: int = 64,
-                 max_image_area: int = 512 * 768,
-                 max_ratio: float = 2):
-
-        self.requested_bucket_count = num_buckets
-        self.bucket_length_min = bucket_side_min
-        self.bucket_length_max = bucket_side_max
-        self.bucket_increment = bucket_side_increment
-        self.max_image_area = max_image_area
-        self.batch_size = batch_size
-        self.total_dropped = 0
-
-        if max_ratio <= 0:
-            self.max_ratio = float('inf')
-        else:
-            self.max_ratio = max_ratio
-
-        self.store = store
-        self.buckets = []
-        self._bucket_ratios = []
-        self._bucket_interp = None
-        self.bucket_data: Dict[tuple, List[int]] = dict()
-        self.init_buckets()
-        self.fill_buckets()
-
-    def init_buckets(self):
-        possible_lengths = list(range(self.bucket_length_min, self.bucket_length_max + 1, self.bucket_increment))
-        possible_buckets = list((w, h) for w, h in itertools.product(possible_lengths, possible_lengths)
-                        if w >= h and w * h <= self.max_image_area and w / h <= self.max_ratio)
-
-        buckets_by_ratio = {}
-
-        # group the buckets by their aspect ratios
-        for bucket in possible_buckets:
-            w, h = bucket
-            # use precision to avoid spooky floats messing up your day
-            ratio = '{:.4e}'.format(w / h)
-
-            if ratio not in buckets_by_ratio:
-                group = set()
-                buckets_by_ratio[ratio] = group
-            else:
-                group = buckets_by_ratio[ratio]
-
-            group.add(bucket)
-
-        # now we take the list of buckets we generated and pick the largest by area for each (the first sorted)
-        # then we put all of those in a list, sorted by the aspect ratio
-        # the square bucket (LxL) will be the first
-        unique_ratio_buckets = sorted([sorted(buckets, key=_sort_by_area)[-1]
-                                       for buckets in buckets_by_ratio.values()], key=_sort_by_ratio)
-
-        # how many buckets to create for each side of the distribution
-        bucket_count_each = int(np.clip((self.requested_bucket_count + 1) / 2, 1, len(unique_ratio_buckets)))
-
-        # we know that the requested_bucket_count must be an odd number, so the indices we calculate
-        # will include the square bucket and some linearly spaced buckets along the distribution
-        indices = {*np.linspace(0, len(unique_ratio_buckets) - 1, bucket_count_each, dtype=int)}
-
-        # make the buckets, make sure they are unique (to remove the duplicated square bucket), and sort them by ratio
-        # here we add the portrait buckets by reversing the dimensions of the landscape buckets we generated above
-        buckets = sorted({*(unique_ratio_buckets[i] for i in indices),
-                          *(tuple(reversed(unique_ratio_buckets[i])) for i in indices)}, key=_sort_by_ratio)
-
-        self.buckets = buckets
-
-        # cache the bucket ratios and the interpolator that will be used for calculating the best bucket later
-        # the interpolator makes a 1d piecewise interpolation where the input (x-axis) is the bucket ratio,
-        # and the output is the bucket index in the self.buckets array
-        # to find the best fit we can just round that number to get the index
-        self._bucket_ratios = [w / h for w, h in buckets]
-        self._bucket_interp = interp1d(self._bucket_ratios, list(range(len(buckets))), assume_sorted=True,
-                                       fill_value=None)
-
-        for b in buckets:
-            self.bucket_data[b] = []
-
-    def get_batch_count(self):
-        return sum(len(b) // self.batch_size for b in self.bucket_data.values())
-
-    def get_bucket_info(self):
-        return json.dumps({ "buckets": self.buckets, "bucket_ratios": self._bucket_ratios })
-
-    def get_batch_iterator(self) -> Generator[Tuple[Tuple[int, int, int]], None, None]:
-        """
-        Generator that provides batches where the images in a batch fall on the same bucket
-
-        Each element generated will be:
-            (index, w, h)
-
-        where each image is an index into the dataset
-        :return:
-        """
-        max_bucket_len = max(len(b) for b in self.bucket_data.values())
-        index_schedule = list(range(max_bucket_len))
-        random.shuffle(index_schedule)
-
-        bucket_len_table = {
-            b: len(self.bucket_data[b]) for b in self.buckets
-        }
-
-        bucket_schedule = []
-        for i, b in enumerate(self.buckets):
-            bucket_schedule.extend([i] * (bucket_len_table[b] // self.batch_size))
-
-        random.shuffle(bucket_schedule)
-
-        bucket_pos = {
-            b: 0 for b in self.buckets
-        }
-
-        total_generated_by_bucket = {
-            b: 0 for b in self.buckets
-        }
-
-        for bucket_index in bucket_schedule:
-            b = self.buckets[bucket_index]
-            i = bucket_pos[b]
-            bucket_len = bucket_len_table[b]
-
-            batch = []
-            while len(batch) != self.batch_size:
-                # advance in the schedule until we find an index that is contained in the bucket
-                k = index_schedule[i]
-                if k < bucket_len:
-                    entry = self.bucket_data[b][k]
-                    batch.append(entry)
-
-                i += 1
-
-            total_generated_by_bucket[b] += self.batch_size
-            bucket_pos[b] = i
-            yield [(idx, *b) for idx in batch]
-
-    def fill_buckets(self):
-        entries = self.store.entries_iterator()
-        total_dropped = 0
-
-        for entry, index in tqdm.tqdm(entries, total=len(self.store)):
-            if not self._process_entry(entry, index):
-                total_dropped += 1
-
-        for b, values in self.bucket_data.items():
-            # shuffle the entries for extra randomness and to make sure dropped elements are also random
-            random.shuffle(values)
-
-            # make sure the buckets have an exact number of elements for the batch
-            to_drop = len(values) % self.batch_size
-            self.bucket_data[b] = list(values[:len(values) - to_drop])
-            total_dropped += to_drop
-
-        self.total_dropped = total_dropped
-
-    def _process_entry(self, entry: Image.Image, index: int) -> bool:
-        aspect = entry.width / entry.height
-
-        if aspect > self.max_ratio or (1 / aspect) > self.max_ratio:
-            return False
-
-        best_bucket = self._bucket_interp(aspect)
-
-        if best_bucket is None:
-            return False
-
-        bucket = self.buckets[round(float(best_bucket))]
-
-        self.bucket_data[bucket].append(index)
-
-        del entry
-
-        return True
-
-class AspectBucketSampler(torch.utils.data.Sampler):
-    def __init__(self, bucket: AspectBucket, num_replicas: int = 1, rank: int = 0):
+# for confused questions <contact@lopho.org>
+# or via discord <lopho#5445>
+class SimpleBucket(torch.utils.data.Sampler):
+    """
+    Batches samples into buckets of same size.
+    """
+    def __init__(self,
+            store: ImageStore,
+            batch_size: int,
+            shuffle: bool = True,
+            num_replicas: int = 1,
+            rank: int = 0,
+            resize: bool = False,
+            image_side_min: int = 256,
+            image_side_max: int = 1024,
+            image_side_divisor: int = 64,
+            max_image_area: int = 512 * 512,
+            fixed_size: Optional[tuple[int, int]] = None
+    ):
         super().__init__(None)
-        self.bucket = bucket
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.store = store
+        self.buckets = dict()
+        self.ratios = []
+        if resize:
+            m = image_side_divisor
+            if fixed_size is not None:
+                assert (fixed_size[0] // m) == fixed_size[0] / m
+                assert (fixed_size[1] // m) == fixed_size[1] / m
+            self.fixed_size = fixed_size
+            assert (image_side_min // m) == image_side_min / m
+            assert (image_side_max // m) == image_side_max / m
+            self.image_side_min = image_side_min
+            self.image_side_max = image_side_max
+            self.image_side_divisor = image_side_divisor
+            self.max_image_area = max_image_area
+        self.init_buckets(resize)
         self.num_replicas = num_replicas
         self.rank = rank
 
     def __iter__(self):
-        # subsample the bucket to only include the elements that are assigned to this rank
-        indices = self.bucket.get_batch_iterator()
-        indices = list(indices)[self.rank::self.num_replicas]
-        return iter(indices)
+        # generate batches
+        batches = []
+        for b in self.buckets:
+            idxs = self.buckets[b]
+            if self.shuffle:
+                random.shuffle(idxs)
+            rest = len(idxs) % self.batch_size
+            idxs = idxs[rest:]
+            batched_idxs = [idxs[i:i + self.batch_size] for i in range(0, len(idxs), self.batch_size)]
+            for bidx in batched_idxs:
+                batches.append([(idx, b[0], b[1]) for idx in bidx])
+        if self.shuffle:
+            random.shuffle(batches)
+        return iter(batches[self.rank::self.num_replicas])
 
     def __len__(self):
-        return self.bucket.get_batch_count() // self.num_replicas
+        return self.get_batch_count() // self.num_replicas
+
+    def get_batch_count(self) -> int:
+        return reduce(lambda x, y: x + len(y) // self.batch_size, self.buckets.values(), 0)
+
+    def _fit_image_size(self, w, h):
+        if self.fixed_size is not None:
+            return self.fixed_size
+        max_area = self.max_image_area
+        scale = (max_area / (w * h)) ** 0.5
+        m = self.image_side_divisor
+        w2 = round((w * scale) / m) * m
+        h2 = round((h * scale) / m) * m
+        if w2 * h2 > max_area: # top end can round over limits
+            w = int((w * scale) / m) * m
+            h = int((h * scale) / m) * m
+        else:
+            w = w2
+            h = h2
+        w = min(max(w, self.image_side_min), self.image_side_max)
+        h = min(max(h, self.image_side_min), self.image_side_max)
+        return w, h
+
+    def init_buckets(self, resize = False):
+        entries = self.store.entries_iterator()
+        # create buckets
+        buckets = {}
+        for img, idx in tqdm.tqdm(entries, total=len(self.store), desc='Bucketing', dynamic_ncols=True):
+            if resize:
+                key = self._fit_image_size(img.width, img.height)
+            else:
+                key = (img.width, img.height)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(idx)
+            img.close()
+        # fit buckets < batch_size in closest bucket if resizing is enabled
+        if resize:
+            for b in buckets:
+                if len(buckets[b]) < self.batch_size:
+                    # find next best bucket
+                    own_ratio = b[0] / b[1]
+                    best_fit = float('inf')
+                    best_bucket = None
+                    for ob in buckets:
+                        if ob == b:
+                            continue
+                        r = ob[0] / ob[1]
+                        if abs(own_ratio - r) < best_fit:
+                            best_fit = r
+                            best_bucket = ob
+                    if best_bucket is not None:
+                        buckets[best_bucket] += buckets[b]
+                        buckets[b] = []
+        # filter buckets < batch_size
+        drop_buckets = []
+        for b in buckets:
+            if len(buckets[b]) < self.batch_size:
+                drop_buckets.append(b)
+            else:
+                self.ratios.append(b[0] / b[1])
+        for b in drop_buckets:
+            buckets.pop(b)
+        self.buckets = buckets
+
+    def get_bucket_info(self):
+        return json.dumps({
+                "buckets": list(self.buckets.keys()),
+                "ratios": self.ratios
+        })
+
 
 class AspectDataset(torch.utils.data.Dataset):
     def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, device: torch.device, ucg: float = 0.1):
@@ -814,14 +746,23 @@ def main():
     # load dataset
     store = ImageStore(args.dataset)
     dataset = AspectDataset(store, tokenizer, text_encoder, device, ucg=args.ucg)
-    bucket = AspectBucket(store, args.num_buckets, args.batch_size, args.bucket_side_min, args.bucket_side_max, 64, args.resolution * args.resolution, 2.0)
-    sampler = AspectBucketSampler(bucket=bucket, num_replicas=world_size, rank=rank)
+    sampler = SimpleBucket(
+            store = store,
+            batch_size = args.batch_size,
+            shuffle = args.shuffle,
+            resize = args.resize,
+            image_side_min = args.bucket_side_min,
+            image_side_max = args.bucket_side_max,
+            image_side_divisor = 64,
+            max_image_area = args.resolution ** 2,
+            num_replicas = world_size,
+            rank = rank
+    )
 
     print(f'STORE_LEN: {len(store)}')
 
     if args.output_bucket_info:
-        print(bucket.get_bucket_info())
-        exit(0)
+        print(sampler.get_bucket_info())
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
