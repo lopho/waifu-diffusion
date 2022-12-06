@@ -314,20 +314,21 @@ class SimpleBucket(torch.utils.data.Sampler):
         self.ratios = []
         if resize:
             m = image_side_divisor
+            assert (max_image_area // m) == max_image_area / m, "resolution not multiple of divisor"
+            if image_side_max is not None:
+                assert (image_side_max // m) == image_side_max / m, "side not multiple of divisor"
+            if image_side_min is not None:
+                assert (image_side_min // m) == image_side_min / m, "side not multiple of divisor"
+            if fixed_size is not None:
+                assert (fixed_size[0] // m) == fixed_size[0] / m, "side not multiple of divisor"
+                assert (fixed_size[1] // m) == fixed_size[1] / m, "side not multiple of divisor"
             if image_side_min is None:
                 if image_side_max is None:
                     image_side_min = m
                 else:
-                    image_side_min = max_image_area / image_side_max
-                    image_side_min = round(image_side_min / m) * m
+                    image_side_min = max((max_image_area // image_side_max) * m, m)
             if image_side_max is None:
-                image_side_max = max_image_area / image_side_min
-                image_side_max = (image_side_max // m) * m
-            assert (image_side_min // m) == image_side_min / m
-            assert (image_side_max // m) == image_side_max / m
-            if fixed_size is not None:
-                assert (fixed_size[0] // m) == fixed_size[0] / m
-                assert (fixed_size[1] // m) == fixed_size[1] / m
+                image_side_max = max((max_image_area // image_side_min) * m, m)
             self.fixed_size = fixed_size
             self.image_side_min = image_side_min
             self.image_side_max = image_side_max
