@@ -56,8 +56,8 @@ parser.add_argument('--resume', type=str, default=None, help='The path to the ch
 parser.add_argument('--run_name', type=str, default=None, required=True, help='Name of the finetune run.')
 parser.add_argument('--dataset', type=str, default=None, required=True, help='The path to the dataset to use for finetuning.')
 parser.add_argument('--num_buckets', type=int, default=16, help='The number of buckets.')
-parser.add_argument('--bucket_side_min', type=int, default=256, help='The minimum side length of a bucket.')
-parser.add_argument('--bucket_side_max', type=int, default=768, help='The maximum side length of a bucket.')
+parser.add_argument('--bucket_side_min', type=int, help='The minimum side length of a bucket.')
+parser.add_argument('--bucket_side_max', type=int, help='The maximum side length of a bucket.')
 parser.add_argument('--lr', type=float, default=5e-6, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -269,9 +269,9 @@ class ImageStore:
         return len(self.image_files)
 
     # iterator returns images as PIL images and their index in the store
-    def entries_iterator(self) -> Generator[Tuple[Img, int], None, None]:
-        for f in range(len(self)):
-            yield Image.open(self.image_files[f]), f
+    def __iter__(self) -> Generator[Tuple[Img, int], None, None]:
+        for i, f in enumerate(self.image_files):
+            yield Image.open(f), i
 
     # get image by index
     def get_image(self, ref: Tuple[int, int, int]) -> Img:
@@ -300,10 +300,10 @@ class SimpleBucket(torch.utils.data.Sampler):
             num_replicas: int = 1,
             rank: int = 0,
             resize: bool = False,
-            image_side_min: int = 256,
-            image_side_max: int = 1024,
             image_side_divisor: int = 64,
-            max_image_area: int = 512 * 512,
+            max_image_area: int = 512 ** 2,
+            image_side_min: Optional[int] = None,
+            image_side_max: Optional[int] = None,
             fixed_size: Optional[tuple[int, int]] = None
     ):
         super().__init__(None)
@@ -314,16 +314,26 @@ class SimpleBucket(torch.utils.data.Sampler):
         self.ratios = []
         if resize:
             m = image_side_divisor
+            if image_side_min is None:
+                if image_side_max is None:
+                    image_side_min = m
+                else:
+                    image_side_min = max_image_area / image_side_max
+                    image_side_min = round(image_side_min / m) * m
+            if image_side_max is None:
+                image_side_max = max_image_area / image_side_min
+                image_side_max = (image_side_max // m) * m
+            assert (image_side_min // m) == image_side_min / m
+            assert (image_side_max // m) == image_side_max / m
             if fixed_size is not None:
                 assert (fixed_size[0] // m) == fixed_size[0] / m
                 assert (fixed_size[1] // m) == fixed_size[1] / m
             self.fixed_size = fixed_size
-            assert (image_side_min // m) == image_side_min / m
-            assert (image_side_max // m) == image_side_max / m
             self.image_side_min = image_side_min
             self.image_side_max = image_side_max
             self.image_side_divisor = image_side_divisor
             self.max_image_area = max_image_area
+        self.dropped_samples = []
         self.init_buckets(resize)
         self.num_replicas = num_replicas
         self.rank = rank
@@ -369,45 +379,37 @@ class SimpleBucket(torch.utils.data.Sampler):
         return w, h
 
     def init_buckets(self, resize = False):
-        entries = self.store.entries_iterator()
         # create buckets
         buckets = {}
-        for img, idx in tqdm.tqdm(entries, total=len(self.store), desc='Bucketing', dynamic_ncols=True):
-            if resize:
-                key = self._fit_image_size(img.width, img.height)
-            else:
-                key = (img.width, img.height)
-            if key not in buckets:
-                buckets[key] = []
-            buckets[key].append(idx)
+        for img, idx in tqdm.tqdm(self.store, desc='Bucketing', dynamic_ncols=True):
+            key = img.size
             img.close()
+            if resize:
+                key = self._fit_image_size(*key)
+            buckets.setdefault(key, []).append(idx)
         # fit buckets < batch_size in closest bucket if resizing is enabled
         if resize:
             for b in buckets:
                 if len(buckets[b]) < self.batch_size:
-                    # find next best bucket
-                    own_ratio = b[0] / b[1]
+                    # find closest bucket
                     best_fit = float('inf')
                     best_bucket = None
                     for ob in buckets:
-                        if ob == b:
+                        if ob == b or len(buckets[ob]) == 0:
                             continue
-                        r = ob[0] / ob[1]
-                        if abs(own_ratio - r) < best_fit:
-                            best_fit = r
+                        d = abs(ob[0] - b[0]) + abs(ob[1] - b[1])
+                        if d < best_fit:
+                            best_fit = d
                             best_bucket = ob
                     if best_bucket is not None:
-                        buckets[best_bucket] += buckets[b]
-                        buckets[b] = []
-        # filter buckets < batch_size
-        drop_buckets = []
-        for b in buckets:
+                        buckets[best_bucket].extend(buckets[b])
+                        buckets[b].clear()
+        # drop buckets < batch_size
+        for b in list(buckets.keys()):
             if len(buckets[b]) < self.batch_size:
-                drop_buckets.append(b)
+                self.dropped_samples += buckets.pop(b)
             else:
                 self.ratios.append(b[0] / b[1])
-        for b in drop_buckets:
-            buckets.pop(b)
         self.buckets = buckets
 
     def get_bucket_info(self):
