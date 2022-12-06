@@ -149,12 +149,6 @@ def get_gpu_ram() -> str:
            f"{gpu_str}" \
            f"{torch_str}"
 
-def _sort_by_ratio(bucket: tuple) -> float:
-    return bucket[0] / bucket[1]
-
-def _sort_by_area(bucket: tuple) -> float:
-    return bucket[0] * bucket[1]
-
 class Validation():
     def __init__(self, is_skipped: bool, is_extended: bool) -> None:
         if is_skipped:
@@ -293,7 +287,6 @@ class ImageStore:
         with open(filename, 'r', encoding='UTF-8') as f:
             return f.read()
 
-
 # for confused questions <contact@lopho.org>
 # or via discord <lopho#5445>
 class SimpleBucket(torch.utils.data.Sampler):
@@ -422,7 +415,6 @@ class SimpleBucket(torch.utils.data.Sampler):
                 "buckets": list(self.buckets.keys()),
                 "ratios": self.ratios
         })
-
 
 class AspectDataset(torch.utils.data.Dataset):
     def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, device: torch.device, ucg: float = 0.1):
