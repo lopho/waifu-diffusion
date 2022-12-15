@@ -29,6 +29,7 @@ import traceback
 import shutil
 from typing import Optional
 from functools import reduce
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     pynvml.nvmlInit()
@@ -264,6 +265,19 @@ class ImageStore:
         self.resizer = Resize(args.resize, args.no_migration).resize
 
         self.image_files = [x for x in self.image_files if self.validator(x)]
+
+        pool = ThreadPoolExecutor()
+        futures = []
+        for x in self.image_files:
+            futures.append(pool.submit(self.validator, x))
+        self.image_files = [
+                x[1] for x in tqdm.tqdm(
+                    zip(futures, self.image_files),
+                    total=len(self.image_files),
+                    desc='Validating', dynamic_ncols=True)
+                if x[0].result()
+        ]
+        pool.shutdown(wait=True)
 
     def __len__(self) -> int:
         return len(self.image_files)
@@ -768,9 +782,17 @@ def main():
     
     # Migrate dataset
     if args.resize and not args.no_migration:
-        for _, batch in enumerate(train_dataloader):
-            continue
-        print(f"Completed resize and migration to '{args.dataset}_cropped' please relaunch the trainer without the --resize argument and train on the migrated dataset.")
+        pool = ThreadPoolExecutor()
+        pbar = tqdm.tqdm(total=len(dataset), desc='Migrating', dynamic_ncols=True)
+        def _callback(x):
+            x.result().close()
+            pbar.update(1)
+        for b in sampler:
+            for idx, w, h in b:
+                f = pool.submit(store.get_image, (idx, w, h))
+                f.add_done_callback(_callback)
+        pool.shutdown(wait = True)
+        tqdm.tqdm.write(f"Completed resize and migration to '{args.dataset}_cropped' please relaunch the trainer without the --resize argument and train on the migrated dataset.")
         exit(0)
 
     # create ema
